@@ -1,0 +1,876 @@
+#! /bin/bash -
+# This script is based on "mcwrapper" by Spike Grobstein. It got some
+# adjustments for using it as a Solaris SMF Method Script.
+#
+# Copyright (c) 2011 Spike Grobstein <spikegrobstein@mac.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+. /lib/svc/share/smf_include.sh
+
+# SMF_FMRI is the name of the target service. This allows multiple instances
+# to use the same script.
+getproparg() {
+	val=`svcprop -p $1 $SMF_FMRI`
+	[[ -n "$val" ]] && echo $(eval echo $val)
+}
+
+function print_usage {
+  local MCWRAPPER_NAME=$( basename $0 )
+  
+	echo "USAGE:"
+	echo "    $MCWRAPPER_NAME <action> [ <action_options> ]"
+	echo ""
+	echo "Action can be one of:"
+	echo "    start     -- start the server if it's not already running"
+	echo "    stop      -- stop a running server"
+	echo "    restart   -- restart a running server (issues stop, waits for it to stop, then starts)"
+	echo "    status    -- whether the server is running or not"
+	echo "    log       -- follows the server log as it's written to"
+	echo "    logrotate -- do a logrotate (regardless of current logsize)"
+	echo "    backup    -- backup minecraft world data to configured backupdir"
+	echo "    config    -- used to read configuration information about mcwrapper"
+	echo "               example: $MCWRAPPER_NAME config serverpath"
+	echo "               valid configuration parameters are:"
+	echo "                *  serverpath   -- absolute path to minecraft_server.jar"
+	echo "                *  serverdir    -- absolute path to server directory (containing minecraft_server.jar)"
+	echo "                *  pidfile      -- absolute path to mcwrapper pidfile"
+	echo "                *  pid          -- the pid of the currently running minecraft server process"
+	echo "                *  pipe         -- absolute path to the mcwrapper command pipe"
+	echo "                *  command      -- the command that will be used to launch the minecraft server"
+	echo "                *  backupdir    -- the path to the backup directory"
+	echo "                *  latestbackup -- the path to the latest backup if there is one"
+	echo "                *  all	      -- print complete configuration"
+	echo "    prop      -- used to read server.properties configuration information"
+	echo "               best when used with external scripts"
+	echo "               example: $MCWRAPPER_NAME prop level-name"
+	echo "    command   -- execute a minecraft server command. As an alternative to writing to the FIFO. Also aliased as 'cmd'"
+	echo "Any other action is interpretted as a server command and is directed to the minecraft server"
+	echo "For README and other documentation, see: https://github.com/spikegrobstein/mcwrapper"
+	echo ""
+}
+
+# configure self from config file
+function read_config {
+	# base server dir
+	BASE_DIR=`getproparg minecraft/basedir`
+
+	# default filename of the minecraft server
+	MINECRAFT_SERVER_NAME=`getproparg minecraft/jarname`
+
+	# filename of the minecraft server.properties file
+	SERVER_PROPERTIES_PATH=`getproparg minecraft/serverproperties`
+
+	# path to the minecraft_server.jar
+	MINECRAFT_SERVER_PATH="${BASE_DIR}/${MINECRAFT_SERVER_NAME}"
+		
+	# Java VM settings (increasing these never hurts)
+	MS_SIZE=`getproparg minecraft/heap_min`
+	MX_SIZE=`getproparg minecraft/heap_max`
+	JAVA_ARGS=`getproparg minecraft/java_args`
+
+	# these can be relative or absolute paths
+	# if relative, they're relative to the mcwrapper executable
+	PID_FILE=`getproparg minecraft/pidfile`
+	COMMAND_PIPE=`getproparg minecraft/commandpipe`
+
+	# the directory of the minecraft_server.jar based off $MINECRAFT_SERVER_PATH
+	MINECRAFT_SERVER_DIR_PATH=`dirname $MINECRAFT_SERVER_PATH`
+	
+	BACKUP_DIRECTORY_PATH=`getproparg backup/backupdir`
+	
+	# what the name of the symlink is.
+	LATEST_BACKUP_NAME=`getproparg backup/latestname`
+	
+	# how many backups to keep in the backups directory
+	# (we automatically delete old backups)
+	# set to -1 to retain ALL backups (never delete)
+	# set to 0 to completely disable backups.
+	BACKUPS_TO_KEEP=`getproparg backup/count`
+
+	# wether to backup before stopping the server
+	BACKUP_ON_EXIT=`getproparg backup/backup_on_exit`
+
+	# compress backup?
+	COMPRESS_BACKUP=`getproparg backup/compress`
+	COMPRESS_TYPE=`getproparg backup/compress_type`
+	
+	# set backup name to
+	#   +%Y%m%d       -- just the datestamp; no time.
+	#   +%Y%m%d%H%M%S -- full timestamp including hour, minute, second
+	BACKUP_TIME_PATTERN=`getproparg backup/timepattern`
+	CURRENT_BACKUP_NAME=`date ${BACKUP_TIME_PATTERN}`
+
+	# Enable logrotate job, which monitors server log size
+	# and do a rotate if needed
+	ENABLE_LOGROTATE=`getproparg logrotate/enable`
+}
+
+
+# run this to process a loaded config
+# some variables require some modification before they can be used
+# for example $PID_FILE which can be relative or absolute.
+# if relative, we want to prepend the MCWRAPPER_DIR to it.
+function process_config {
+	
+	# PID_FILE can be relative or absolute
+	if [[ ! "$PID_FILE" =~ ^/ ]]; then
+		PID_FILE="${BASE_DIR}/$PID_FILE"
+	fi
+	
+	# COMMAND_PIPE can be relative or absolute
+	if [[ ! "$COMMAND_PIPE" =~ ^/ ]]; then
+		COMMAND_PIPE="${BASE_DIR}/$COMMAND_PIPE"
+	fi
+	
+	MINECRAFT_SERVER_CMD="java ${JAVA_ARGS} -Xmx${MX_SIZE} -Xms${MS_SIZE} -jar "$MINECRAFT_SERVER_PATH" nogui"
+	
+	# the path to the server.properties file
+	if [[ ! "$SERVER_PROPERTIES_PATH" =~ ^/ ]]; then
+		SERVER_PROPERTIES_PATH="${MINECRAFT_SERVER_DIR_PATH}/${SERVER_PROPERTIES_PATH}"
+	fi
+	
+	# BACKUP_DIRECTORY_PATH can be relative or absolute
+	if [[ ! "$BACKUP_DIRECTORY_PATH" =~ ^/ ]]; then
+		BACKUP_DIRECTORY_PATH="${BASE_DIR}/${BACKUP_DIRECTORY_PATH}"
+	fi
+
+}
+
+function print_config {
+	echo "General:" >&2
+	echo "  Base Dir: ${BASE_DIR}" >&2
+	echo "  Minecraft Path: ${MINECRAFT_SERVER_PATH}" >&2
+	echo "  Server Properties: ${SERVER_PROPERTIES_PATH}" >&2
+	echo "  PID file: ${PID_FILE}" >&2
+	echo "  Cmd Pipe: ${COMMAND_PIPE}" >&2
+	echo "  Command: ${MINECRAFT_SERVER_CMD}" >&2
+	echo "Backup:" >&2
+	echo "  Backup on exit: ${BACKUP_ON_EXIT}" >&2
+	echo "  Backup dir: ${BACKUP_DIRECTORY_PATH}" >&2
+	echo "  Backups to keep: ${BACKUPS_TO_KEEP}" >&2
+	echo "  Backup pattern: ${BACKUP_TIME_PATTERN}" >&2
+	echo "  Latest backup: "`print_latest_backup`
+	echo "Log rotate:" >&2
+	echo "  Enabled: ${ENABLE_LOGROTATE}" >&2
+	if $ENABLE_LOGROTATE ; then
+		read_logrotate_config
+		echo "  Max log size (kB): ${MAX_LOG_SIZE}" >&2
+		echo "  Check intervall (s): ${CHECK_INTERVAL}" >&2
+		echo "  Logs to keep: ${LOGS_TO_KEEP}" >&2
+	fi
+}
+
+function read_server_property {
+	# takes 1 arg... the property name
+	PROP_NAME=$1;shift
+	
+	if [[ ! -e "$SERVER_PROPERTIES_PATH" ]]; then
+	  echo "Cannot locate server.properties path. ($SERVER_PROPERTIES_PATH)" >&2
+	  exit $SMF_EXIT_ERR_CONFIG
+	fi
+		
+	cat "$SERVER_PROPERTIES_PATH" | grep "$PROP_NAME\=" | awk -F= '{ print $2 }'
+}
+
+function read_command {
+	while true
+	do
+		INPUT=$( cat $COMMAND_PIPE )
+		echo $INPUT
+		
+		# if the user said "stop" then exit after the command completes.
+		if [[ "$INPUT" = "stop" ]]; then
+			stop_logrotate
+			clean_up
+			exit $SMF_EXIT_OK
+		fi
+	done
+}
+
+function send_command {
+	
+	
+	if ! check_is_running ; then
+		echo "Server is NOT running. Not sending command" >&2
+		exit $SMF_EXIT_ERR_FATAL
+	fi
+	
+	COMMAND=$1
+	echo "$COMMAND" > "$COMMAND_PIPE"
+}
+
+function create_pid {
+	PID_VALUE=$1
+	PFILE=$2
+
+	echo $PID_VALUE > $PFILE
+}
+
+function remove_pid {
+	# clean up PID file when done.
+	PFILE=$1
+
+	rm $PFILE
+}
+
+# reads the pidfile and echos it
+# returns 1 if the pidfile does not exist or if there was an error reading it.
+function read_pid {
+	PFILE=$1
+	if [[ ! -e "$PFILE" ]]; then
+		return 1
+	fi
+	
+	# TODO: detect errors reading the pid (not readable?) and return non-zero in one of those cases
+	cat "$PFILE"
+}
+
+function check_is_running {
+	PID=`read_pid $PID_FILE`
+	# if read_pid returned a non-zero status, then we're not running
+	if [[ $? != 0 ]]; then
+		return 1
+	fi
+	
+	# check to see if we have a wrapper currently running
+	kill -0 $PID 2>&- 1>&-
+	if [[ $? != 0 ]]; then
+		return 1
+	fi
+	
+	return 0
+}
+
+function set_up_pipe {
+	if [[ ! -p "$COMMAND_PIPE" ]]; then
+		mkfifo "$COMMAND_PIPE"
+		
+		if [[ $? != 0 ]]; then
+			# if mkfifo failed, print error message, exit non-zero.
+			echo "Error creating the pipe: $COMMAND_PIPE ($?)." >&2
+			exit $SMF_EXIT_ERR_FATAL
+		fi
+	fi
+}
+
+function remove_pipe {
+	if [[ -p "$COMMAND_PIPE" ]]; then
+		rm "$COMMAND_PIPE"
+	fi
+}
+
+function start_minecraft {
+	# write the PID file and start'er up!
+	# don't start if we're already running.
+	if check_is_running ; then
+		echo "Server is already running. Exiting..." >&2
+		exit $SMF_EXIT_ERR_FATAL
+	fi
+	print_config
+	set_up_pipe
+	
+	# now we `cd` to the minecraft_server directory and start the server in a background process
+	cd $MINECRAFT_SERVER_DIR_PATH
+	read_command | $MINECRAFT_SERVER_CMD &> /dev/null &
+	
+	create_pid $! $PID_FILE	
+
+	start_logrotate
+}
+
+# stops the minecraft server by sending it the 'stop' command via the FIFO
+function stop_minecraft {
+	# $BACKUP_ON_EXIT is a trusted boolean true or false so we directly execute the content of the variable
+  	if $BACKUP_ON_EXIT ; then
+    		echo ""
+    		echo -n "Backing up world data before exiting..." >&2
+    		backup_world
+    		if [[ $? = 0 ]]; then
+    			echo "Done." >&2
+    		elif [[ ! $? = -1 ]]; then
+			echo "Error while backing up world" >&2
+		fi
+  	fi
+
+	send_command "stop"
+}
+
+function restart_minecraft {
+	stop_minecraft
+	wait_for_minecraft_to_stop
+	start_minecraft
+}
+
+# waits for minecraft to stop
+function wait_for_minecraft_to_stop {
+	if check_is_running ; then
+		# if it's still running... sleep for 1 second and try again
+		echo -n "."
+		sleep 1
+		wait_for_minecraft_to_stop
+	fi
+}
+
+function server_log_path {
+	echo "${MINECRAFT_SERVER_DIR_PATH}/server.log"
+}
+
+function check_server_log_exists {
+	if [[ -e `server_log_path` ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+# tail and follow the server.log
+# ^C to stop
+function tail_server_log {
+	local SERVER_LOG_PATH=`server_log_path`
+	# make sure that the log file exists before trying to tail it.
+	if ! check_server_log_exists ; then
+		echo "Server log not found! ($SERVER_LOG_PATH)" >&2
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+	
+	tail -f `server_log_path`
+}
+
+function sanity_check {
+	# check to make sure that PID_FILE and COMMAND_PIPE are writable
+	if [[ ! -w `dirname $PID_FILE` ]]; then
+		echo "No write permission is granted on $PID_FILE"
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+
+	if [[ ! -w `dirname $COMMAND_PIPE` ]]; then
+		echo "No write permission is granted on $COMMAND_PIPE"
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+
+	# check to make sure that things that need to exist exist.
+	if [[ ! -e "$MINECRAFT_SERVER_PATH" ]]; then
+		# the minecraft server path does not exist.
+		echo "Minecraft server not found! ($MINECRAFT_SERVER_PATH)"
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+}
+
+# performs cleanup after stopping mcwrapper
+# removes pid and pipe
+function clean_up {
+	remove_pid $PID_FILE
+	remove_pipe
+
+	if $ENABLE_LOGROTATE ; then
+		remove_pid $LOG_ROTATE_PID
+	fi
+}
+
+##########################################################################################
+## MCBackup portion: ============>>>>>>>>>>>>
+
+
+# create the backup directory
+# if it exists, this effectively does nothing.
+function create_backup_directory () {
+	mkdir -p "$CURRENT_BACKUP_PATH"
+	
+	if [[ $? != 0 ]]; then
+		#an error occurred
+		echo "An error occurred when creating the backup directory." >&2
+		exit $SMF_EXIT_ERR_FATAL
+	fi
+}
+
+# stop writing to the world file(s) after flushing the buffer
+function stop_writing_world () {
+	send_command "save-all"
+	send_command "save-off"
+}
+
+# begin writing the world data again
+function start_writing_world () {
+	send_command "save-on"
+}
+
+# copy the world data and configuration
+function do_backup () {
+	local LEVEL_NAME=`read_server_property level-name`
+	local WORLD_DATA_DIR="${MINECRAFT_SERVER_DIR_PATH}/${LEVEL_NAME}"
+	
+	cp -R "$WORLD_DATA_DIR" "$CURRENT_BACKUP_PATH/"
+	
+	if [[ $? != 0 ]]; then
+		#an error occurred
+		echo "An error occurred when copying the world data." >&2
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+	
+	cp -R "${MINECRAFT_SERVER_DIR_PATH}/"*.{txt,properties} "$CURRENT_BACKUP_PATH/"
+	
+	if [[ $? != 0 ]]; then
+		#an error occurred
+		echo "An error occurred when copying the configuration information" >&2
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+	
+	if "$COMPRESS_BACKUP" ; then
+
+		# cd to the backup directory
+		cd "$BACKUP_DIRECTORY_PATH"
+	
+		local FILENAME=`basename "$CURRENT_BACKUP_PATH"`
+		ARCHIVE_FILENAME="${FILENAME}.${COMPRESS_TYPE}"
+	
+		case "$COMPRESS_TYPE" in
+			zip )
+				zip -q -r "$ARCHIVE_FILENAME" "$FILENAME"
+				;;
+			tgz )
+				tar cfz "$ARCHIVE_FILENAME" "$FILENAME"	
+				;;
+			tbz2 )
+				tar cfj "$ARCHIVE_FILENAME" "$FILENAME"
+				;;
+			Z )
+				tar cfZ "$ARCHIVE_FILENAME" "$FILENAME"
+				;;
+			* )
+				echo "UKNOWN COMPRESSION TYPE: $COMPRESS_BACKUP"
+				exit $SMF_EXIT_ERR_CONFIG
+				;;
+		esac
+		
+		# after the backup is compressed, remove the uncompressed version
+		rm -rf "$CURRENT_BACKUP_PATH"
+		
+		# we set CURRENT_BACKUP_PATH so the symlink gets pointed to the archive rather than the directory we just deleted
+		CURRENT_BACKUP_PATH="${BACKUP_DIRECTORY_PATH}/${ARCHIVE_FILENAME}"
+	fi
+}
+
+
+function create_symlink () {
+	# then we symlink the current backup to "latest" in backups directory
+	if [[ -L "$LATEST_BACKUP_PATH" ]]; then
+		# if the symlink already exists, delete it before creating it.
+		rm "$LATEST_BACKUP_PATH"
+		
+		if [[ $? != 0 ]]; then
+			#an error occurred
+			echo "An error occurred when deleting the old symlink." >&2
+			exit $SMF_EXIT_ERR_CONFIG
+		fi
+	fi
+	
+	# just the directory/filename of the current backup
+	# this way, the symlink isn't an absolute path, so you can move the 
+	# backup directory without issue.
+	local NEW_BACKUP=`basename "$CURRENT_BACKUP_PATH"`
+	
+	ln -s "$NEW_BACKUP" "$LATEST_BACKUP_PATH"
+	
+	if [[ $? != 0 ]]; then
+		#an error occurred
+		echo "An error occurred when creating the symlink." >&2
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+}
+
+# delete old backups
+function cleanup_old_backups () {
+	if [[ $BACKUPS_TO_KEEP -eq -1 ]]; then
+    		# if we want infinite retention, then set BACKUPS_TO_KEEP to -1
+    		return
+  	fi
+  
+	echo "Cleaning up old backups..."
+	
+  	OLD_BACKUPS=`ls -r "$BACKUP_DIRECTORY_PATH" | grep -v "$LATEST_BACKUP_NAME" | tail +$(( ${BACKUPS_TO_KEEP}+1 ))l`
+	for old_backup in $OLD_BACKUPS; do
+  		echo "Removing $old_backup"
+		rm -rf "${BACKUP_DIRECTORY_PATH}/$old_backup"
+		if [[ $? != 0 ]]; then
+			#an error occurred but don't exit.
+			echo "An error occurred when deleting a previous backup: ${old_backup}." >&2
+		fi
+	done
+}
+
+# call this to go through the whole backup procedure
+# makes sure backup directory exists, makes sure we don't back up a worldfile that's actively being written to, backs it up, symlinks it. everything.
+function backup_world {
+  if [[ $BACKUPS_TO_KEEP -eq 0 ]]; then
+    # set BACKUPS_TO_KEEP to 0 to disable backups entirely.
+    echo ""
+    echo "Backups are disabled. Not backing anything up."
+    return -1
+  fi
+  
+	# the path to the to-be-backed-up directory
+	CURRENT_BACKUP_PATH="${BACKUP_DIRECTORY_PATH}/$CURRENT_BACKUP_NAME"
+	
+	# the path to the symlink to the above.
+	LATEST_BACKUP_PATH="${BACKUP_DIRECTORY_PATH}/${LATEST_BACKUP_NAME}"
+	
+	create_backup_directory
+	
+	# stop writing world if we're running
+	if check_is_running ; then
+		stop_writing_world
+	fi
+	
+	do_backup
+	
+	# start writing world only if we're running
+	if check_is_running ; then
+		start_writing_world
+	fi
+	
+	create_symlink
+	print_latest_backup
+		
+	cleanup_old_backups
+
+	return 0
+}
+
+function print_latest_backup {
+	LATEST_BACKUP_PATH="${BACKUP_DIRECTORY_PATH}/${LATEST_BACKUP_NAME}"
+
+	# if the link doesn't exist, then warn the user and exit with a 1
+	if [[ ! -L "$LATEST_BACKUP_PATH" ]]; then
+		echo "Latest backup not found. Either never created or not a link or something. ($LATEST_BACKUP_PATH)" >&2
+		exit $SMF_EXIT_ERR_CONFIG
+	fi
+			
+	# read the link to the latest backup
+	LATEST_BACKUP_LINK=`readlink "$LATEST_BACKUP_PATH"`
+				
+	# if the link to the latest backup is absolute, output that, otherwise, build the path and output that.
+	if [[ "$LATEST_BACKUP_LINK" =~ ^/ ]]; then
+		echo $LATEST_BACKUP_LINK
+	else
+		echo "${BACKUP_DIRECTORY_PATH}/${LATEST_BACKUP_LINK}"				
+	fi
+}
+
+## End MCBackup portion.
+##########################################################################################
+
+##########################################################################################
+## Log roll portion: ============>>>>>>>>>>>>
+
+function start_logrotate {
+
+	if $ENABLE_LOGROTATE ; then
+
+		#read job configuration
+		read_logrotate_config
+
+		#start job
+		monitor_log &
+
+		create_pid $1 $LOG_ROTATE_PID
+		echo "Log rotation monitor started. PID: "`read_pid $PID_FILE` >&2		
+	fi
+
+}
+
+function stop_logrotate {
+
+	if $ENABLE_LOGROTATE ; then
+		PID=`read_pid $LOG_ROTATE_PID`
+		
+		# the loop stops itself if minecraft is not running anymore
+		# but we must interrupt the sleep in order to avoid long stop times
+		kill -14 $PID 2>&- 1>&-
+
+	fi
+}
+
+# Reads all necessary paramter from service configuration
+# This funtion only gets called if $ENABLE_LOGROTATE = true
+function read_logrotate_config {
+	# maximum log size in kilo byte
+	MAX_LOG_SIZE=`getproparg logrotate/max_log_size`
+
+	# interval for checking the server log
+	CHECK_INTERVAL=`getproparg logrotate/check_interval`
+
+	# number of log to keep
+	LOGS_TO_KEEP=`getproparg logrotate/logs_to_keep`
+
+	# the pid file for logrotate thread
+	LOG_ROTATE_PID="${PID_FILE}_logrotate"
+
+	# sanity check
+	if [[ ! $MAX_LOG_SIZE -gt 0 ]]; then
+		echo "Configuration error: max_log_size muste be greater than 0" >&2
+	fi
+
+	if [[ ! $CHECK_INTERVAL -gt 0 ]]; then
+		echo "Configuration error: check_interval muste be greater than 0" >&2
+	fi
+
+	# PID_FILE can be relative or absolute
+	if [[ ! "$LOG_ROTATE_PID" =~ ^/ ]]; then
+		LOG_ROTATE_PID="${BASE_DIR}/$LOG_ROTATE_PID"
+	fi
+}
+
+function monitor_log {
+
+	# we will monitor the log as long as minecraft is running
+	while check_is_running 
+	do
+		if logrotation_needed ; then
+			rotate_log
+		fi
+		
+		# sleep for configured time
+		sleep $CHECK_INTERVAL
+	done
+
+}
+
+function logrotation_needed {
+
+	if check_server_log_exists ; then
+		local SERVER_LOG_PATH=`server_log_path`
+		# get current log size in kilo byte
+		local LOG_SIZE=$(( `stat -c %s ${SERVER_LOG_PATH}`/1024 ))
+
+		# if we have reached the configured maximum return true
+		if [[ $LOG_SIZE -ge $MAX_LOG_SIZE ]]; then
+			return 0
+		fi
+	fi
+
+	# no rotation needed
+	return 1
+}
+
+function rotate_log {
+	# check again for safety, maybe we want to call this method directly from outside
+	if check_server_log_exists ; then
+		local SERVER_LOG_PATH=`server_log_path`
+
+		# Structure:
+		# SERVER_LOG[0]=server.log.1
+		# SERVER_LOG[1]=server.log.2
+		local SERVER_LOGS=(`ls ${SERVER_LOG_PATH}.* | grep -v server.log.lck`)
+		
+		# We working reverse after following schema
+		# $ rm server.log.10
+		# $ mv server.log.9 > server.log.10
+		# ...
+		# $ mv server.log.1 > server.log.2
+		for ((i=${#SERVER_LOGS[*]}; i>=1; i--))
+		do
+			j=$(( ${i}+1 ))
+			# check whether we have to move or delete the log
+			if [[ $i -ge $LOGS_TO_KEEP ]]; then
+				rm ${SERVER_LOG_PATH}.${i}
+				if [[ $? != 0 ]]; then
+					echo "LogRotate: Can not remove log ${SERVER_LOG_PATH}.${i}" >&2
+					exit $SMF_EXIT_ERR_FATAL
+				fi
+			else
+				mv ${SERVER_LOG_PATH}.${i} ${SERVER_LOG_PATH}.${j}
+				if [[ $? != 0 ]]; then
+					echo "LogRotate: Can not move log ${SERVER_LOG_PATH}.${i} to ${SERVER_LOG_PATH}.${j}" >&2
+					exit $SMF_EXIT_ERR_FATAL
+				fi
+			fi
+		
+		done
+
+		# Now we can move server.log to server.log.1
+		cp -p ${SERVER_LOG_PATH} ${SERVER_LOG_PATH}.1
+		if [[ $? -eq 0 ]]; then
+	                # truncate the existing log without restarting server
+	                cat /dev/null > ${SERVER_LOG_PATH}
+			if [[ $? != 0 ]]; then
+				echo "LogRotate: Can not truncate ${SERVER_LOG_PATH}" >&2
+				exit $SMF_EXIT_ERR_FATAL
+			fi
+	        else    
+			echo "LogRotate: Can not copy log ${SERVER_LOG_PATH} to ${SERVER_LOG_PATH}.${i}" >&2
+			exit $SMF_EXIT_ERR_FATAL
+	        fi
+
+	fi
+}
+
+## End MCBackup portion.
+##########################################################################################
+
+
+## begin meat of program:
+
+if [[ $# -eq 0 ]]; then
+	print_usage
+	exit $SMF_EXIT_OK
+fi
+
+ACTION=$1;shift
+
+# selfconfigure
+read_config
+process_config
+
+# check to make sure that we're in a sane configuration
+# function exits on error.
+sanity_check
+
+# must cd to minecraft server directory to make sure support files are created in the correct place.
+
+case $ACTION in
+	start )
+		echo -n "Starting minecraft... "	
+		start_minecraft
+		echo "Done."
+		exit $SMF_EXIT_OK
+		;;
+	stop )
+		echo -n "Stopping minecraft... "
+		stop_minecraft
+		echo "Done."
+		exit $SMF_EXIT_OK
+		;;
+	restart )
+		echo -n "Restarting minecraft..."
+		restart_minecraft
+		echo " Done."
+		exit $SMF_EXIT_OK
+		;;
+	status )
+		if check_is_running ; then
+			echo "Server is running." >&2
+			echo "PID: "`read_pid $PID_FILE`
+			if $ENABLE_LOGROTATE ; then
+				echo "LogRotate PID: "`read_pid $LOG_ROTATE_PID`
+			fi
+			exit $SMF_EXIT_OK
+		fi
+		
+		echo "Server is NOT running." >&2
+		exit $SMF_EXIT_OK
+		
+		;;
+	backup )
+	  echo "Backing up minecraft world data..."
+		backup_world
+		echo "Done."
+		exit $SMF_EXIT_OK
+		;;
+	log )
+		if check_server_log_exists ; then
+			echo "Tailing from: ${MINECRAFT_SERVER_DIR_PATH}/server.log" >&2
+			echo "Press ^C to cancel." >&2
+			echo "-------------------------------------------------------------------------------------------" >&2
+		fi
+		tail_server_log
+		exit $SMF_EXIT_OK
+		;;
+	logrotate )
+		read_logrotate_config
+		rotate_log
+		exit $SMF_EXIT_OK
+		;;
+	config )
+		# dump info about the config
+		CONFIG_SETTING=$1
+		case $CONFIG_SETTING in
+			serverpath )
+				echo $MINECRAFT_SERVER_PATH
+				exit $SMF_EXIT_OK
+				;;
+			serverdir )
+				echo $MINECRAFT_SERVER_DIR_PATH
+				exit $SMF_EXIT_OK
+				;;
+			pidfile )
+				echo $PID_FILE
+				exit $SMF_EXIT_OK
+				;;
+			pid )
+				if check_is_running ; then
+					echo `read_pid $PID_FILE`
+					exit $SMF_EXIT_OK
+				else
+					echo "Server is NOT running." >&2
+					exit $SMF_EXIT_ERR_FATAL
+				fi
+				;;
+			pipe )
+				echo $COMMAND_PIPE
+				exit $SMF_EXIT_OK
+				;;
+			all )
+				print_config
+				exit $SMF_EXIT_OK
+				;;
+			command )
+				echo $MINECRAFT_SERVER_CMD
+				exit $SMF_EXIT_OK
+				;;
+			backupdir )
+				echo $BACKUP_DIRECTORY_PATH
+				exit $SMF_EXIT_OK
+				;;
+			latestbackup )
+				print_latest_backup
+				exit $SMF_EXIT_OK
+				;;
+			*)
+				echo "Unknown config setting: $CONFIG_SETTING"
+				exit 1
+				;;
+		esac
+		;;
+	prop )
+		PROP=$1
+		read_server_property $PROP
+		exit $SMF_EXIT_OK
+		;;
+	help )
+		print_usage
+		exit $SMF_EXIT_OK
+		;;
+	command|cmd )
+		COMMAND="$@"
+		echo -n "sending: $COMMAND ... "
+		send_command "$COMMAND"
+		echo "Done."
+		exit $SMF_EXIT_OK
+		;;
+	* )
+		echo "Invalid action: $ACTION" >&2
+		echo "" >&2
+		print_usage
+		exit $SMF_EXIT_ERR_CONFIG
+esac
+
+exit $SMF_EXIT_OK
+
+

@@ -1,0 +1,171 @@
+<?xml version='1.0'?>
+<!DOCTYPE service_bundle SYSTEM '/usr/share/lib/xml/dtd/service_bundle.dtd.1'>
+
+<!--
+ CDDL HEADER START
+
+ The contents of this file are subject to the terms of the
+ Common Development and Distribution License, Version 1.0 only
+ (the "License").  You may not use this file except in compliance
+ with the License.
+
+ You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
+ or http://www.opensolaris.org/os/licensing.
+ See the License for the specific language governing permissions
+ and limitations under the License.
+
+ When distributing Covered Code, include this CDDL HEADER in each
+ file and include the License file at usr/src/OPENSOLARIS.LICENSE.
+ If applicable, add the following below this CDDL HEADER, with the
+ fields enclosed by brackets "[]" replaced with your own identifying
+ information: Portions Copyright [yyyy] [name of copyright owner]
+
+ CDDL HEADER END
+
+  *** Minecraft.xml ***
+
+  The Service is written to start a Minecraft Server and
+  enable multi-instance on the same box or zone
+
+
+  Version 1 by Christofer Ostwald
+-->
+
+<service_bundle type='manifest' name='minecraft'>
+
+  <service 
+	name='application/minecraft' 
+	type='service' 
+	version='1'>
+
+
+      	<dependency name='network' 
+		grouping='require_all' 
+		restart_on='error' 
+		type='service'>
+       		 <service_fmri value='svc:/milestone/network:default'/>
+      	</dependency>
+
+      	<dependency name='filesystem-local' 
+		grouping='require_all' 
+		restart_on='none' 
+		type='service'>
+        	<service_fmri value='svc:/system/filesystem/local:default'/>
+      	</dependency>
+	
+	<dependent name='minecraft_multi-user-server'
+		grouping='optional_all'
+		restart_on='none'>
+		<service_fmri value='svc:/milestone/multi-user-server'/>
+	</dependent>
+
+      	<exec_method 
+		name='start' 
+		type='method' 
+		exec='/lib/svc/method/svc-minecraft %m' 
+		timeout_seconds='30'>
+      	</exec_method>
+
+      	<exec_method 
+		name='stop' 
+		type='method' 
+		exec='/lib/svc/method/svc-minecraft %m' 
+		timeout_seconds='30'>
+      	</exec_method>
+
+	<instance name='default' enabled='false'>
+      	 	<method_context>
+			<method_credential 
+				user='mineserv' 
+				group='bin'/>
+		</method_context>
+		<property_group name='minecraft' type='application'>
+			<propval 
+				name='basedir' type='astring'
+				value="/usr/minecraft/default" />
+			<propval 
+				name='jarname' type='astring'
+				value='minecraft_server.jar' />
+			<propval 
+				name='serverproperties' type='astring'
+				value="server.properties" />
+			<!-- java heap size, 64-Bit java is recommended -->
+			<propval 
+				name='heap_min' type='astring'
+				value='1024M' />
+			<propval 
+				name='heap_max' type='astring'
+				value='4096M' />
+			<propval 
+				name='pidfile' type='astring'
+				value='default.pid' />
+			<propval 
+				name='commandpipe' type='astring'
+				value='default.fifo' />
+			<!-- additional java arguments -->
+			<propval
+				name='java_args' type='astring'
+				value="-d64" />
+		</property_group>
+		<property_group name='backup' type='application'>
+			<!--  backup to an nfs or smb mount is advisable -->
+			<propval 
+				name='backupdir' type='astring'
+				value="/usr/minecraft/backup/default" />
+			<propval 
+				name='backup_on_exit' type='boolean'
+				value="false" />
+			<!-- name of the link, which points to the latest backup -->
+			<propval 
+				name='latestname' type='astring'
+				value="latest" />
+			<propval
+				name='backups_to_keep' type='integer'
+				value="5" />
+			<!-- backup name -->
+			<propval 
+				name='timepattern' type='astring'
+				value="+%Y%m%d%H%M%S" />
+			<propval 
+				name='compress' type='boolean'
+				value="true" />
+			<!-- supports: "zip", "Z", "tgz", "tbz2" -->
+			<propval
+				name='compress_type' type='astring'
+				value="tgz" />
+		</property_group>
+		<property_group name='logrotate' type='application'>
+			<propval 
+				name='enable' type='boolean'
+				value="true" />
+			<!-- time to sleep (s/m/h/d)-->
+			<propval
+				name='check_interval' type='integer'
+				value="1h" />
+			<!-- max log size in kilo byte, if server log gets
+			     bigger than this, logs will be rotated -->
+			<propval
+				name='max_log_size' type='integer'
+				value="64" />
+			<propval 
+				name='logs_to_keep' type='integer'
+				value="10" />
+		</property_group>
+	</instance>
+
+    <stability value='Evolving'/>
+
+    <template>
+    	<common_name>
+        	<loctext xml:lang='C'>Minecraft Server v.1.x</loctext>
+      	</common_name>
+      	<documentation>
+	      <doc_link name='de.minecraftwiki.net' uri='http://de.minecraftwiki.net/wiki/Server'/>
+	      <doc_link name='github.com' uri='https://github.com/c-ostwald/solaris-smf'/>
+      	</documentation>
+    </template>
+
+
+  </service>
+
+</service_bundle>
